@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
-use pollster::FutureExt;
-use winit;
 
 mod renderer;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
 
     let event_loop = winit::event_loop::EventLoop::new();
@@ -18,34 +17,36 @@ fn main() -> Result<()> {
         .build(&event_loop)
         .context("Failed to build window")?;
 
-    let mut renderer = renderer::Renderer::new(&window).block_on()?;
+    let mut renderer = renderer::Renderer::new(&window).await?;
 
-    event_loop.run(move |e, _, control_flow| {
-        use winit::{
-            event::{Event, WindowEvent},
-            event_loop::ControlFlow,
-        };
+    tokio::task::block_in_place(move || {
+        event_loop.run(move |e, _, control_flow| {
+            use winit::{
+                event::{Event, WindowEvent},
+                event_loop::ControlFlow,
+            };
 
-        *control_flow = ControlFlow::Poll;
+            *control_flow = ControlFlow::Poll;
 
-        match e {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(size) => {
-                    renderer.resize_surface(size);
+            match e {
+                Event::WindowEvent { event, .. } => match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::Resized(size) => {
+                        renderer.resize_surface(size);
+                    }
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        renderer.resize_surface(*new_inner_size);
+                    }
+                    _ => (),
+                },
+                Event::MainEventsCleared => {
+                    window.request_redraw();
                 }
-                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                    renderer.resize_surface(*new_inner_size);
+                Event::RedrawRequested(..) => {
+                    renderer.render();
                 }
                 _ => (),
-            },
-            Event::MainEventsCleared => {
-                window.request_redraw();
             }
-            Event::RedrawRequested(..) => {
-                renderer.render();
-            }
-            _ => (),
-        }
-    });
+        });
+    })
 }
