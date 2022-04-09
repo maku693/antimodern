@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, Result};
 
 mod renderer;
@@ -17,7 +19,15 @@ async fn main() -> Result<()> {
         .build(&event_loop)
         .context("Failed to build window")?;
 
-    let mut renderer = renderer::Renderer::new(&window).await?;
+    let renderer = Arc::new(RwLock::new(renderer::Renderer::new(&window).await?));
+
+    {
+        let renderer = renderer.clone();
+        tokio::task::spawn_blocking(move || loop {
+            renderer.read().unwrap().poll_device();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+    }
 
     tokio::task::block_in_place(move || {
         event_loop.run(move |e, _, control_flow| {
@@ -32,10 +42,10 @@ async fn main() -> Result<()> {
                 Event::WindowEvent { event, .. } => match event {
                     WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(size) => {
-                        renderer.resize_surface(size);
+                        renderer.write().unwrap().resize_surface(size);
                     }
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        renderer.resize_surface(*new_inner_size);
+                        renderer.write().unwrap().resize_surface(*new_inner_size);
                     }
                     _ => (),
                 },
@@ -43,7 +53,7 @@ async fn main() -> Result<()> {
                     window.request_redraw();
                 }
                 Event::RedrawRequested(..) => {
-                    renderer.render();
+                    renderer.read().unwrap().render();
                 }
                 _ => (),
             }
