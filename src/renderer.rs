@@ -5,6 +5,8 @@ use bytemuck::bytes_of;
 use glam::{vec3, Mat4};
 use wgpu::util::DeviceExt;
 
+const NUM_MAX_INFLIGHT_FRAMES: u8 = 3;
+
 pub struct Renderer {
     surface: wgpu::Surface,
     surface_configuration: wgpu::SurfaceConfiguration,
@@ -13,9 +15,11 @@ pub struct Renderer {
 
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
-    instance_buffer: wgpu::Buffer,
+    instance_buffer: [wgpu::Buffer; NUM_MAX_INFLIGHT_FRAMES as usize],
     num_instances: u32,
     uniform_buffer: wgpu::Buffer,
+    frame: u8,
+    frame_stream: Stream,
 
     bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
@@ -78,11 +82,17 @@ impl Renderer {
         let num_vertices = vertices.len() as u32;
 
         let instances = [vec3(0f32, 0., 0.), vec3(-0.5, 0., 0.), vec3(0.5, 0., 0.)];
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_buffer_desc = wgpu::BufferDescriptor {
             label: None,
-            contents: bytes_of(&instances),
+            size: size_of_val(&instances) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::VERTEX,
-        });
+            mapped_at_creation: false,
+        };
+        let instance_buffer = [
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+        ];
         let num_instances = instances.len() as u32;
 
         let proj_matrix = Mat4::orthographic_lh(-1f32, 1., -1., 1., 0., 1.);
@@ -185,6 +195,9 @@ impl Renderer {
     }
 
     pub fn render(&self) {
+        self.frame = (self.frame + 1) % NUM_MAX_INFLIGHT_FRAMES;
+        let instance_buffer = self.instance_buffer[self.frame as usize];
+
         let frame_buffer = self
             .surface
             .get_current_texture()
@@ -214,7 +227,7 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
             render_pass.draw(0..self.num_vertices, 0..self.num_instances);
         }
 
