@@ -1,9 +1,16 @@
-use std::mem::size_of_val;
+use std::{
+    future::{self, ready},
+    mem::size_of_val,
+    time::Instant,
+};
 
 use anyhow::{Context, Ok, Result};
-use bytemuck::bytes_of;
-use glam::{vec3, Mat4};
+use bytemuck::{bytes_of, from_bytes};
+use futures::{channel::oneshot, future::FutureExt};
+use glam::{vec3, Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
+
+const NUM_MAX_INFLIGHT_BUFFERS: usize = 3;
 
 pub struct Renderer {
     surface: wgpu::Surface,
@@ -11,9 +18,11 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
 
+    frame: futures::lock::Mutex<usize>,
+
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
-    instance_buffer: wgpu::Buffer,
+    instance_buffer: [wgpu::Buffer; NUM_MAX_INFLIGHT_BUFFERS],
     num_instances: u32,
     uniform_buffer: wgpu::Buffer,
 
@@ -65,6 +74,8 @@ impl Renderer {
         };
         surface.configure(&device, &surface_configuration);
 
+        let frame = futures::lock::Mutex::new(3);
+
         let vertices = [
             vec3(-0.1f32, -0.1, 0.),
             vec3(0., 0.1, 0.),
@@ -78,11 +89,19 @@ impl Renderer {
         let num_vertices = vertices.len() as u32;
 
         let instances = [vec3(0f32, 0., 0.), vec3(-0.5, 0., 0.), vec3(0.5, 0., 0.)];
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_buffer_desc = wgpu::BufferDescriptor {
             label: None,
-            contents: bytes_of(&instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+            size: size_of_val(&instances) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::MAP_READ
+                | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        };
+        let instance_buffer = [
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+        ];
         let num_instances = instances.len() as u32;
 
         let proj_matrix = Mat4::orthographic_lh(-1f32, 1., -1., 1., 0., 1.);
@@ -174,6 +193,7 @@ impl Renderer {
             surface_configuration,
             device,
             queue,
+            frame,
             vertex_buffer,
             num_vertices,
             instance_buffer,
@@ -184,7 +204,33 @@ impl Renderer {
         })
     }
 
-    pub fn render(&self) {
+    pub async fn render(&mut self) -> Result<()> {
+        let mut frame = *self.frame.get_mut();
+        frame = (frame + 1) % NUM_MAX_INFLIGHT_BUFFERS;
+
+        let now = Instant::now();
+        log::info!("frame {}: begin", frame);
+
+        let instance_buffer = &self.instance_buffer[frame];
+
+        let instance_buffer_slice = instance_buffer.slice(..);
+
+        instance_buffer_slice.map_async(wgpu::MapMode::Read).await?;
+        let mut vertices =
+            from_bytes::<[Vec3; 3]>(&instance_buffer_slice.get_mapped_range()).clone();
+        for v in vertices.iter_mut() {
+            *v = Mat3::from_rotation_y(0.1) * *v;
+        }
+        instance_buffer.unmap();
+
+        instance_buffer_slice
+            .map_async(wgpu::MapMode::Write)
+            .await?;
+        instance_buffer_slice
+            .get_mapped_range_mut()
+            .copy_from_slice(bytes_of(&vertices));
+        instance_buffer.unmap();
+
         let frame_buffer = self
             .surface
             .get_current_texture()
@@ -214,13 +260,22 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance_buffer_slice);
             render_pass.draw(0..self.num_vertices, 0..self.num_instances);
         }
 
         self.queue.submit(Some(encoder.finish()));
 
         frame_buffer.present();
+
+        log::info!("frame {}: elapsed: {}ms", frame, now.elapsed().as_millis());
+
+        self.queue
+            .on_submitted_work_done()
+            .then(|_| async move { drop(frame) })
+            .await;
+
+        Ok(())
     }
 
     pub fn resize_surface(&mut self, size: winit::dpi::PhysicalSize<u32>) {

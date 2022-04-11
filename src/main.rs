@@ -29,6 +29,7 @@ fn main() -> Result<()> {
     {
         let renderer = renderer.clone();
         std::thread::spawn(move || loop {
+            log::info!("polling");
             renderer.read().unwrap().poll_device();
             sleep(Duration::from_millis(100));
         });
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
                 window.request_redraw();
             }
             Event::RedrawRequested(..) => {
-                renderer.read().unwrap().render();
+                renderer.write().unwrap().render().block_on().unwrap();
             }
             _ => (),
         }
