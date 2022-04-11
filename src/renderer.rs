@@ -1,28 +1,21 @@
 use std::mem::size_of_val;
+use std::time::Instant;
 
 use anyhow::{Context, Ok, Result};
-use bytemuck::bytes_of;
-use glam::{vec3, Mat4};
+use bytemuck::{bytes_of, from_bytes};
+use futures::future::FutureExt;
+use glam::{vec3, Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-pub struct Renderer {
+pub struct GPUContext {
     surface: wgpu::Surface,
     surface_configuration: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
     queue: wgpu::Queue,
-
-    vertex_buffer: wgpu::Buffer,
-    num_vertices: u32,
-    instance_buffer: wgpu::Buffer,
-    num_instances: u32,
-    uniform_buffer: wgpu::Buffer,
-
-    bind_group: wgpu::BindGroup,
-    render_pipeline: wgpu::RenderPipeline,
 }
 
-impl Renderer {
-    pub async fn new(window: &winit::window::Window) -> Result<Renderer> {
+impl GPUContext {
+    pub async fn new(window: &winit::window::Window) -> Result<GPUContext> {
         let instance = wgpu::Instance::new(wgpu::Backends::PRIMARY);
 
         let surface = unsafe { instance.create_surface(window) };
@@ -65,6 +58,59 @@ impl Renderer {
         };
         surface.configure(&device, &surface_configuration);
 
+        Ok(GPUContext {
+            surface,
+            surface_configuration,
+            device,
+            queue,
+        })
+    }
+
+    pub fn surface(&self) -> &wgpu::Surface {
+        &self.surface
+    }
+
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_configuration.format
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn resize_surface(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        self.surface_configuration.width = size.width;
+        self.surface_configuration.height = size.height;
+        self.surface
+            .configure(&self.device, &self.surface_configuration)
+    }
+}
+
+const NUM_MAX_INFLIGHT_BUFFERS: usize = 3;
+
+pub struct Renderer {
+    frame: futures::lock::Mutex<usize>,
+
+    vertex_buffer: wgpu::Buffer,
+    num_vertices: u32,
+    instance_buffer: [wgpu::Buffer; NUM_MAX_INFLIGHT_BUFFERS],
+    num_instances: u32,
+    uniform_buffer: wgpu::Buffer,
+
+    bind_group: wgpu::BindGroup,
+    render_pipeline: wgpu::RenderPipeline,
+}
+
+impl Renderer {
+    pub fn new(context: &GPUContext) -> Result<Renderer> {
+        let device = context.device();
+
+        let frame = futures::lock::Mutex::new(3);
+
         let vertices = [
             vec3(-0.1f32, -0.1, 0.),
             vec3(0., 0.1, 0.),
@@ -78,11 +124,20 @@ impl Renderer {
         let num_vertices = vertices.len() as u32;
 
         let instances = [vec3(0f32, 0., 0.), vec3(-0.5, 0., 0.), vec3(0.5, 0., 0.)];
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_buffer_desc = wgpu::BufferDescriptor {
             label: None,
-            contents: bytes_of(&instances),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+            size: size_of_val(&instances) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::MAP_READ
+                | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        };
+        let instance_buffer = [
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+            device.create_buffer(&instance_buffer_desc),
+        ];
+
         let num_instances = instances.len() as u32;
 
         let proj_matrix = Mat4::orthographic_lh(-1f32, 1., -1., 1., 0., 1.);
@@ -160,7 +215,7 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader_module,
                     entry_point: "fs_main",
-                    targets: &[surface_configuration.format.into()],
+                    targets: &[context.surface_format().into()],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: None,
@@ -170,10 +225,7 @@ impl Renderer {
         };
 
         Ok(Renderer {
-            surface,
-            surface_configuration,
-            device,
-            queue,
+            frame,
             vertex_buffer,
             num_vertices,
             instance_buffer,
@@ -184,9 +236,36 @@ impl Renderer {
         })
     }
 
-    pub fn render(&self) {
-        let frame_buffer = self
-            .surface
+    pub async fn render(&mut self, context: &GPUContext) -> Result<()> {
+        let mut frame = *self.frame.lock().await;
+        frame = (frame + 1) % NUM_MAX_INFLIGHT_BUFFERS;
+        *self.frame.get_mut() = frame;
+
+        let now = Instant::now();
+        log::info!("frame {}: begin", frame);
+
+        let instance_buffer = &self.instance_buffer[frame];
+
+        let instance_buffer_slice = instance_buffer.slice(..);
+
+        instance_buffer_slice.map_async(wgpu::MapMode::Read).await?;
+        let mut vertices =
+            from_bytes::<[Vec3; 3]>(&instance_buffer_slice.get_mapped_range()).clone();
+        for v in vertices.iter_mut() {
+            *v = Mat3::from_rotation_y(0.1) * *v;
+        }
+        instance_buffer.unmap();
+
+        instance_buffer_slice
+            .map_async(wgpu::MapMode::Write)
+            .await?;
+        instance_buffer_slice
+            .get_mapped_range_mut()
+            .copy_from_slice(bytes_of(&vertices));
+        instance_buffer.unmap();
+
+        let frame_buffer = context
+            .surface()
             .get_current_texture()
             .expect("Failed to get next surface texture");
 
@@ -194,8 +273,8 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .device
+        let mut encoder = context
+            .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         {
@@ -214,19 +293,32 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
             render_pass.draw(0..self.num_vertices, 0..self.num_instances);
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        context.queue().submit(Some(encoder.finish()));
 
         frame_buffer.present();
-    }
 
-    pub fn resize_surface(&mut self, size: winit::dpi::PhysicalSize<u32>) {
-        self.surface_configuration.width = size.width;
-        self.surface_configuration.height = size.height;
-        self.surface
-            .configure(&self.device, &self.surface_configuration)
+        log::info!(
+            "frame {} present: elapsed: {}ms",
+            frame,
+            now.elapsed().as_millis()
+        );
+
+        context
+            .queue()
+            .on_submitted_work_done()
+            .then(|_| async move {
+                log::info!(
+                    "frame {} submitted work done: elapsed: {}ms",
+                    frame,
+                    now.elapsed().as_millis()
+                );
+            })
+            .await;
+
+        Ok(())
     }
 }
