@@ -1,9 +1,9 @@
 use std::mem::size_of_val;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Ok, Result};
 use bytemuck::{bytes_of, from_bytes};
-use futures::future::FutureExt;
 use glam::{vec3, Mat3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
@@ -93,7 +93,7 @@ impl GPUContext {
 const NUM_MAX_INFLIGHT_BUFFERS: usize = 3;
 
 pub struct Renderer {
-    frame: futures::lock::Mutex<usize>,
+    frame: std::sync::atomic::AtomicUsize,
 
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
@@ -109,7 +109,7 @@ impl Renderer {
     pub fn new(context: &GPUContext) -> Result<Renderer> {
         let device = context.device();
 
-        let frame = futures::lock::Mutex::new(3);
+        let frame = std::sync::atomic::AtomicUsize::new(3);
 
         let vertices = [
             vec3(-0.1f32, -0.1, 0.),
@@ -236,10 +236,10 @@ impl Renderer {
         })
     }
 
-    pub async fn render(&mut self, context: &GPUContext) -> Result<()> {
-        let mut frame = *self.frame.lock().await;
+    pub async fn render(&self, context: &GPUContext) -> Result<()> {
+        let mut frame = self.frame.load(Ordering::SeqCst);
         frame = (frame + 1) % NUM_MAX_INFLIGHT_BUFFERS;
-        *self.frame.get_mut() = frame;
+        self.frame.store(frame, Ordering::SeqCst);
 
         let now = Instant::now();
         log::info!("frame {}: begin", frame);
@@ -297,27 +297,27 @@ impl Renderer {
             render_pass.draw(0..self.num_vertices, 0..self.num_instances);
         }
 
-        context.queue().submit(Some(encoder.finish()));
-
-        frame_buffer.present();
-
         log::info!(
-            "frame {} present: elapsed: {}ms",
+            "frame {}: draw: elapsed: {}ms",
             frame,
             now.elapsed().as_millis()
         );
 
-        context
-            .queue()
-            .on_submitted_work_done()
-            .then(|_| async move {
-                log::info!(
-                    "frame {} submitted work done: elapsed: {}ms",
-                    frame,
-                    now.elapsed().as_millis()
-                );
-            })
-            .await;
+        context.queue().submit(Some(encoder.finish()));
+
+        log::info!(
+            "frame {}: submit: elapsed: {}ms",
+            frame,
+            now.elapsed().as_millis()
+        );
+
+        frame_buffer.present();
+
+        log::info!(
+            "frame {}: present: elapsed: {}ms",
+            frame,
+            now.elapsed().as_millis()
+        );
 
         Ok(())
     }

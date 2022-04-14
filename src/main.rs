@@ -28,13 +28,13 @@ fn main() -> Result<()> {
     let renderer = renderer::Renderer::new(&context)?;
 
     let context = Arc::new(RwLock::new(context));
-    let renderer = Arc::new(RwLock::new(renderer));
+    let renderer = Arc::new(renderer);
 
     {
         let context = context.clone();
         thread::spawn(move || loop {
             context.read().unwrap().device().poll(wgpu::Maintain::Poll);
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(100));
         });
     }
 
@@ -61,16 +61,10 @@ fn main() -> Result<()> {
                 window.request_redraw();
             }
             Event::RedrawRequested(..) => {
-                let context = context.clone();
-                let renderer = renderer.clone();
-                thread::spawn(move || {
-                    renderer
-                        .write()
-                        .unwrap()
-                        .render(&context.read().unwrap())
-                        .block_on()
-                        .unwrap();
-                });
+                renderer
+                    .render(&context.read().unwrap())
+                    .block_on()
+                    .unwrap();
             }
             _ => (),
         }
